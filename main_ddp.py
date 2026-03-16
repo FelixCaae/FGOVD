@@ -60,7 +60,7 @@ def get_distributed_dataloaders(data_cfg, training_cfg, rank, world_size):
             train_dataloader.dataset,
             batch_size=train_dataloader.batch_size,
             sampler=train_sampler,
-            num_workers=8,
+            num_workers=4,
             pin_memory=True,
             drop_last=True
         )
@@ -197,7 +197,7 @@ def main_worker(rank, world_size, args):
             training_cfg['n_accumulation_steps'],
             lvis_query_embeds=queries,
             writer=writer,
-            amp=False,
+            amp=args.amp,
         )#if epoch > -1 else {'loss_triplet': 0, 'loss_bg': 0, 'loss_bbox': 0, 'loss_giou': 0}
        
         if rank==0:
@@ -266,6 +266,8 @@ def main():
     parser.add_argument('--do_not_use_hf_lvis_evaluation', action='store_true', help="If setted, the evaluation on LVIS will be performed without the HuggingFace interface and by using the model as it is trained.") 
     parser.add_argument('--out', type=str, default="result", help="Base OWL model to use")
     parser.add_argument('--world_size', type=int, default=torch.cuda.device_count(), help="Number of GPUs to use")
+    parser.add_argument('--amp', action = 'store_true')
+    
     args = parser.parse_args()
     
     # 启动多进程训练
