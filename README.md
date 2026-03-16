@@ -5,5 +5,5 @@
 4. pip install -r requirements.txt
 ## 训练，多卡
 使用--amp 开启混合精度，但是有训崩了的风险
-python main_ddp.py --world_size 8 --config configs/basev2.yaml 
+python main_ddp.py --world_size 8 --config configs/base-v2.yaml 
 
