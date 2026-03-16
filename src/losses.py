@@ -88,9 +88,9 @@ class PushPullLoss(torch.nn.Module):
             pos_loss = self.contrastive(pred_logits)
         # Negative loss
         neg_targets = torch.zeros(bg_logits.shape).to(bg_logits.device)
-        neg_loss = self.class_criterion(bg_logits, neg_targets)
-        # neg_loss = F.mse_loss(bg_logits , neg_targets)
-        neg_loss = (torch.pow(1 - torch.exp(-neg_loss), 2) * neg_loss).sum(dim=1).mean()
+        # neg_loss = self.class_criterion(bg_logits, neg_targets)
+        neg_loss = F.mse_loss(bg_logits , neg_targets)
+        # neg_loss = (torch.pow(1 - torch.exp(-neg_loss), 2) * neg_loss).sum(dim=1).mean()
 
         return pos_loss, neg_loss
 
