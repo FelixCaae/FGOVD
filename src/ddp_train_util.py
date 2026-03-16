@@ -77,13 +77,13 @@ def train(model,
         inputs = prepare_texts_inputs(model, vocabularies)
         inputs = inputs.to(device)
         
-        if lvis_query_embeds is None:
-            # self-distillation disabled
-            all_pred_boxes, _, pred_sims, _ = model(images, inputs) 
-            lvis_pred_sims = lvis_target_sims = None
-        else:
-            # self-distillation enabled
-            all_pred_boxes, _, pred_sims, _, lvis_pred_sims, lvis_target_sims = model(images, inputs, lvis_query_embeds=lvis_query_embeds) 
+        # if lvis_query_embeds is None:
+        #     # self-distillation disabled
+        #     all_pred_boxes, _, pred_sims, _ = model(images, inputs) 
+        #     lvis_pred_sims = lvis_target_sims = None
+        # else:
+        #     # self-distillation enabled
+        #     all_pred_boxes, _, pred_sims, _, lvis_pred_sims, lvis_target_sims = model(images, inputs, lvis_query_embeds=lvis_query_embeds) 
             
 
         if amp:

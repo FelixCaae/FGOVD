@@ -204,9 +204,8 @@ def main_worker(rank, world_size, args):
             print('start eval')
         # 评估
         model.eval()
-        if epoch % 5==0:
-            val_metrics = validate(model, val_dataloader, deepcopy(val_data), epoch, writer,n_hardnegatives=training_cfg['n_hardnegatives'])
-            print(val_metrics)
+        val_metrics = validate(model, val_dataloader, deepcopy(val_data), epoch, writer,n_hardnegatives=training_cfg['n_hardnegatives'])
+        print(val_metrics)
         if rank == 0:            
             # 打印训练摘要
             progress_summary.update(epoch, train_metrics, val_metrics)
