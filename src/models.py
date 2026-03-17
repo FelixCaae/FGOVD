@@ -38,6 +38,7 @@ class PatchedOwlViTClassPredictionHead(nn.Module):
         return None, pred_sims
 
 
+from .clip_visual_extractor import CLIPVisualExtractor
 class OwlViT(torch.nn.Module):
     """
     We don't train this that's why it's not an nn.Module subclass.
@@ -81,6 +82,16 @@ class OwlViT(torch.nn.Module):
             # self.pretrained_model = pretrained_model.eval()
             self.processor = processor
             self.dummy_image = Image.new("RGB", (224, 224))
+            self.init_distill()
+        
+    def init_distill(self):
+        self.clip = CLIPVisualExtractor('ViT-B/32', 'cuda')
+        self.distill_proj = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Linear(768, 768),
+        )
 
     # Copied from transformers.models.clip.modeling_owlvit.OwlViTForObjectDetection.box_predictor
     # Removed some comments and docstring to clear up clutter for now
@@ -134,6 +145,14 @@ class OwlViT(torch.nn.Module):
         text_embeds = text_embeds / torch.linalg.norm(text_embeds, ord=2, dim=-1, keepdim=True)
         return text_embeds
 
+    def get_distill_loss(self, image, feature_map):
+        spatial_tokens = self.clip.to(image.device).get_spatial_feats(image, image.dtype, return_cls_token=False)
+        _feature_map = feature_map.permute(0, 3, 1, 2).contiguous()
+        _feature_map = self.clip.to(image.device).align_to_sizes(_feature_map, [(spatial_tokens.shape[2], spatial_tokens.shape[3])])[0]
+        loss_distill = 1 - (_feature_map * spatial_tokens / (_feature_map.norm(2, dim=1, keepdim=True) * spatial_tokens.norm(2, dim=1, keepdim=True) + 1e-6)).sum(dim=1)
+        loss_distill = loss_distill.mean(dim=[-1, -2])
+        return loss_distill
+
     def forward(
         self,
         image: torch.Tensor,
@@ -149,6 +168,15 @@ class OwlViT(torch.nn.Module):
             feature_map.shape[1] * feature_map.shape[2],
             feature_map.shape[3],
         )
+        feature_map = feature_map + self.distill_proj(feature_map)
+
+        # spatial_tokens = self.clip.to(image.device).get_spatial_feats(image, image.dtype, return_cls_token=False)
+        # _feature_map = self.distill_proj(feature_map).permute(0, 3, 1, 2).contiguous()
+        # _feature_map = self.clip.to(image.device).align_to_sizes(_feature_map, [(spatial_tokens.shape[2], spatial_tokens.shape[3])])[0]
+        # loss_distill = 1 - (_feature_map * spatial_tokens / (_feature_map.norm(2, dim=1, keepdim=True) * spatial_tokens.norm(2, dim=1, keepdim=True) + 1e-6)).sum(dim=1)
+        # loss_distill = loss_distill.sum(dim=[-1, -2])
+        if self.training:
+            loss_distill = self.get_distill_loss(image, feature_map)
 
         image_feats = torch.reshape(feature_map, new_size)
 
@@ -172,9 +200,78 @@ class OwlViT(torch.nn.Module):
             _, lvis_target_class_sims = self.original_class_predictor(
                 image_feats, lvis_query_embeds
             )
-            return (pred_boxes, pred_class_logits, pred_class_sims, None, lvis_pred_class_sims, lvis_target_class_sims)
+            if self.training:
+                return (pred_boxes, pred_class_logits, pred_class_sims, None, lvis_pred_class_sims, lvis_target_class_sims, loss_distill)
+            else:
+                return (pred_boxes, pred_class_logits, pred_class_sims, None, lvis_pred_class_sims, lvis_target_class_sims)
+        if self.training:
+            return (pred_boxes, pred_class_logits, pred_class_sims, None, loss_distill)
+        else:
+            return (pred_boxes, pred_class_logits, pred_class_sims, None)
+
+import torch.nn.functional as F
+from .load_dino import load_dinov2_hf as load_dinov2, forward_dinov2_hf as forward_dino
+class OwlViT_DINO(OwlViT):
+    def init_distill(self):
+        dino, transform = load_dinov2()
+        self.dino = dino
+        self.transform = transform
+        self.distill_proj = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Linear(768, 768),
+        )
     
-        return (pred_boxes, pred_class_logits, pred_class_sims, None)
+    def get_distill_loss(self, image, feature_map):
+        dino_feat = forward_dino(self.dino, image) # [B, C, H, W]
+        student_feat = student_feat.permute(0,3,1,2).contiguous()
+        student_feat = F.interpolate(
+            student_feat,
+            size=dino_feat.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        import pdb; pdb.set_trace()
+        student_feat = F.normalize(student_feat, dim=1)
+        dino_feat = F.normalize(dino_feat, dim=1)
+        loss = 1 - (student_feat * dino_feat).sum(dim=1)
+        loss = loss.mean(dim=[-1, -2])
+        return loss
+
+from .load_owlv2_large import load_owlv2_hf as load_owlv2, forward_owlv2_hf as forward_owlv2
+class OwlViT_Large(OwlViT):
+    def init_distill(self):
+        model, transform = load_owlv2()
+        self.teacher = model
+        self.transform = transform
+        self.distill_proj = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Linear(768, 768),
+        )
+        self.distill_proj_align = nn.Sequential(
+            nn.Linear(768, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+        )
+
+    def get_distill_loss(self, image, feature_map):
+        teacher_feat = forward_owlv2(self.teacher, image) # [B, C, H, W]
+        student_feat = self.distill_proj_align(feature_map).permute(0,3,1,2).contiguous()
+        student_feat = F.interpolate(
+            student_feat,
+            size=teacher_feat.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        student_feat = F.normalize(student_feat, dim=1)
+        teacher_feat = F.normalize(teacher_feat, dim=1)
+        loss = 1 - (student_feat * teacher_feat).sum(dim=1)
+        loss = loss.mean(dim=[-1, -2])
+        return loss
 
 
 class PostProcess:
@@ -215,11 +312,14 @@ def load_model(device, base_config="google/owlvit-base-patch16"):
         raise ValueError("The starting configuration must come from from owlvit or owlv2")
     _processor = get_processor(base_config)
     _model = _model.eval()
+    # patched_model = OwlViT_Large(pretrained_model=_model, processor=_processor)
+    # patched_model = OwlViT_DINO(pretrained_model=_model, processor=_processor)
     patched_model = OwlViT(pretrained_model=_model, processor=_processor)
         
     for name, parameter in patched_model.named_parameters():
         conditions = [
             "class_predictor" in name and 'original' not in name,
+            'distill_proj' in name
         ]
         if any(conditions):
             continue
