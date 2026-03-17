@@ -106,17 +106,20 @@ def train(model,
         else:
             if lvis_query_embeds is None:
             # self-distillation disabled
-                all_pred_boxes, _, pred_sims, _ = model(images, inputs) 
+                all_pred_boxes, _, pred_sims, _, loss_distill = model(images, inputs) 
                 lvis_pred_sims = lvis_target_sims = None
             else:
             # self-distillation enabled
-                all_pred_boxes, _, pred_sims, _, lvis_pred_sims, lvis_target_sims = model(images, inputs, lvis_query_embeds=lvis_query_embeds) 
+                all_pred_boxes, _, pred_sims, _, lvis_pred_sims, lvis_target_sims, loss_distill = model(images, inputs, lvis_query_embeds=lvis_query_embeds) 
             losses = criterion(pred_sims, labels, all_pred_boxes, boxes, lvis_pred_scores=lvis_pred_sims, lvis_target_scores=lvis_target_sims)
             loss = (
                 losses["loss_triplet"]
                 + losses["loss_bg"]
                 + losses["loss_rank"]
             ) 
+            # loss = loss + loss_distill.mean(dim=-1) * 0.
+            loss = loss + loss_distill.mean(dim=-1) * 0.1
+            print(loss_distill.mean(dim=-1).item(), flush=True)
             loss = loss / n_accumulation_steps
             loss.backward()
         # 只在主进程记录TensorBoard
