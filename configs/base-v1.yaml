@@ -1,0 +1,14 @@
+data:
+  images_path: ./coco/
+  test_annotations_file: ../validation_sets/transparency.json
+  train_annotations_file: ../training_sets/transparency.json
+training:
+  base_model: ../weights/owlvit-base-patch16
+  batch_size: 16
+  learning_rate: 3e-5
+  ltype: triplet
+  margin: 0.15
+  n_epochs: 20
+  n_hardnegatives: 2
+  self_distillation: mse
+  weight_decay: 0.1

@@ -1,0 +1,35 @@
+# 排除训练输出和日志
+runs/
+result*/
+*.log
+nohup.out
+lvis_v1_val.json
+# 排除数据集和权重
+training_sets/
+validation_sets/
+weights/
+benchmarks/
+
+# 排除临时文件
+tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# 排除 IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 排除缓存
+.cache/
+*.pkl

@@ -1,0 +1,16 @@
+data:
+  images_path: /home/wuke_2024/lzx_datasets
+  test_annotations_file: /home/wuke_2024/ov202503/cz_github/FGOVD/validation_sets/1_attributes.json
+  train_annotations_file: /home/wuke_2024/ov202503/cz_github/FGOVD/training_sets/1_attributes.json
+training:
+  base_model:  /home/wuke_2024/ov202503/cz_github/FGOVD/weights/google/owlv2-base-patch16
+  batch_size: 4 # per gpu 
+  val_batch_size: 2 # per gpu
+  learning_rate: 3e-5
+  ltype: triplet
+  margin: 0.15
+  n_accumulation_steps: 2
+  n_epochs: 5
+  n_hardnegatives: 10
+  self_distillation: mse
+  weight_decay: 0.1

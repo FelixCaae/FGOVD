@@ -1,0 +1,26 @@
+data:
+  images_path: /home/wuke_2024/lzx_datasets
+  test_annotations_file: /home/wuke_2024/ov202503/cz_github/FGOVD/validation_sets/1_attributes.json
+  # 功能三：混合多个 attributes 文件，注释掉 train_annotations_file 换用此列表
+  train_annotations_file: /home/wuke_2024/ov202503/cz_github/FGOVD/training_sets/1_attributes.json
+  # train_annotations_files:
+  #   - /home/wuke_2024/ov202503/cz_github/FGOVD/training_sets/1_attributes.json
+  #   - /home/wuke_2024/ov202503/cz_github/FGOVD/training_sets/2_attributes.json
+  #   - /home/wuke_2024/ov202503/cz_github/FGOVD/training_sets/3_attributes.json
+
+training:
+  base_model: /home/wuke_2024/ov202503/cz_github/FGOVD/weights/google/owlv2-base-patch16
+  batch_size: 4           # per gpu
+  val_batch_size: 4       # per gpu
+  learning_rate: 3e-5
+  ltype: triplet
+  margin: 0.15
+  n_accumulation_steps: 2
+  n_epochs: 3
+  n_hardnegatives: 15
+  # 功能一：采样扩充负例目标数，需 > n_hardnegatives 才生效，建议 15~25
+  n_expanded_negatives: 15
+  # 功能二：规则替换每条 ann 最多动态生成几条新负例，设 0 禁用
+  n_rule_negatives: 5
+  self_distillation: mse
+  weight_decay: 0.1
