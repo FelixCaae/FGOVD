@@ -236,7 +236,7 @@ def main():
         print("Large model loaded")
     else:
         processor = Owlv2Processor.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
-        model = Owlv2ForObjectDetection.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
+        model = Owlv2ForObjectDetection.from_pretrained("epoch3_baseline/")
         print("Base model loaded")
     model = model.to(device)
     model.eval()

@@ -180,7 +180,7 @@ def main_worker(rank, world_size, args):
     progress_summary = ProgressFormatter()
     best_map = 0
     # 训练循环
-    for epoch in range(-1, training_cfg["n_epochs"]):
+    for epoch in range(0, training_cfg["n_epochs"]):
         # 设置数据采样器的epoch
         if train_dataloader is not None and hasattr(train_dataloader.sampler, 'set_epoch'):
             train_dataloader.sampler.set_epoch(epoch)

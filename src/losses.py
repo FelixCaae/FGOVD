@@ -31,9 +31,11 @@ class Contrastive(nn.Module):
                         
         elif self.ltype == 'triplet':
             # in addition we perform only triplet loss keeping the image as anchor (row-wise optimization)
+            import pdb;pdb.set_trace()
+            #positive scores should always be 
             positive_scores = scores[:, 0].view(scores.size(0), 1)
             d1 = positive_scores.expand_as(scores)
-
+            
             # compare every diagonal score to scores in its column
             # caption retrieval
             cost_s = (self.margin + scores - d1).clamp(min=0)
@@ -74,6 +76,9 @@ class PushPullLoss(torch.nn.Module):
         """
         src_logits = torch.abs(outputs["pred_logits"])
         src_logits = src_logits.transpose(0, 2).transpose(1, 2)
+        # import pdb;pdb.set_trace()
+        #target_classes bs, 3600, N_tq(text querie num)
+        #pred_logits bs, 3600, N_tq
 
         pred_logits = src_logits[:, target_classes != self.background_label].t()
         bg_logits = src_logits[:, target_classes == self.background_label].t()
@@ -88,9 +93,9 @@ class PushPullLoss(torch.nn.Module):
             pos_loss = self.contrastive(pred_logits)
         # Negative loss
         neg_targets = torch.zeros(bg_logits.shape).to(bg_logits.device)
-        # neg_loss = self.class_criterion(bg_logits, neg_targets)
-        neg_loss = F.mse_loss(bg_logits , neg_targets)
-        # neg_loss = (torch.pow(1 - torch.exp(-neg_loss), 2) * neg_loss).sum(dim=1).mean()
+        neg_loss = self.class_criterion(bg_logits, neg_targets)
+        # neg_loss = F.mse_loss(bg_logits , neg_targets)
+        neg_loss = (torch.pow(1 - torch.exp(-neg_loss), 2) * neg_loss).sum(dim=1).mean()
 
         return pos_loss, neg_loss
 
