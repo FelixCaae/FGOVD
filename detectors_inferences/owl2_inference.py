@@ -26,6 +26,96 @@ import pickle, json
 
 # READ/WRITE UTILITIES
 
+import spacy
+
+nlp = spacy.load("en_core_web_sm")
+
+COLORS = ['black', 'light_blue', 'blue', 'dark_blue', 'light_brown', 'brown', 'dark_brown', 'light_green', 'green', 'dark_green', 'light_grey', 'grey', 'dark_grey', 'light_orange', 'orange', 'dark_orange', 'light_pink', 'pink', 'dark_pink', 'light_purple', 'purple', 'dark_purple', 'light_red', 'red', 'dark_red', 'white', 'light_yellow', 'yellow', 'dark_yellow']
+MATERIALS = ['text', 'stone', 'wood', 'rattan', 'fabric', 'crochet', 'wool', 'leather', 'velvet', 'metal', 'paper', 'plastic', 'glass', 'ceramic']
+PATTERNS = ['plain', 'striped', 'dotted', 'checkered', 'woven', 'studded', 'perforated', 'floral', 'logo']
+TRANSPARENCIES = ['opaque', 'translucent', 'transparent']
+
+ATTRIBUTE_VOCAB = {
+    "color": COLORS,
+    "material": MATERIALS,
+    "pattern": PATTERNS,
+    "transparency": TRANSPARENCIES
+}
+
+def extract_attributes(sentence):
+    doc = nlp(sentence)
+    attrs = []
+    obj = None
+
+    tokens = list(doc)
+    i = 0
+
+    vocab_set = set()
+    for v in ATTRIBUTE_VOCAB.values():
+        vocab_set.update(v)
+
+    while i < len(tokens):
+        token = tokens[i]
+        if token.pos_ == "ADJ":
+            if token.text.lower() in ["light", "dark"]:
+                combined_attrs = token.text.lower() + " " + tokens[i+1].text.lower()
+                attrs.append(combined_attrs)
+                i+=2
+                continue
+            else:
+                attrs.append(token.text.lower())
+        if token.pos_ == "NOUN":
+            if token.text.lower() in vocab_set:
+                attrs.append(token.text.lower())
+                i += 1
+                continue
+            else:
+                obj = token.text.lower()
+        i+=1
+    return attrs, obj
+
+def build_attribute_prompts(attrs, obj):
+    prompts = []
+    for a in attrs:
+        prompts.append(f"a {a} {obj}")
+    return prompts
+
+def build_all_prompts(vocabulary):
+
+    all_prompt_groups = []
+
+    for sent in vocabulary:
+
+        attrs, obj = extract_attributes(sent)
+
+        attr_prompts = build_attribute_prompts(attrs, obj)
+        obj_prompt = f"a {obj}"
+
+        # 最终 prompt 组
+        prompts = [sent] + attr_prompts + [obj_prompt]
+
+        all_prompt_groups.append(prompts)
+
+    return all_prompt_groups
+
+def ensemble_scores(scores):
+
+    # scores: [num_queries, num_prompts]
+
+    s_full = scores[:, 0]              # 原始句子
+    s_attrs = scores[:, 1:-1]          # 属性
+    s_obj = scores[:, -1]              # object
+
+    if s_attrs.shape[1] > 0:
+        s_attr_mean = s_attrs.mean(dim=1)
+    else:
+        s_attr_mean = 0
+
+    # ⭐ 推荐权重（你可以做 ablation）
+    final_score = 0.6 * s_full + 0.3 * s_attr_mean + 0.1 * s_obj
+
+    return final_score
+
 def save_object(obj, path):
     """"Save an object using the pickle library on a file
     
@@ -123,11 +213,30 @@ def evaluate_image(model, processor, im, vocabulary, MAX_PREDICTIONS=100, nms=Fa
     with torch.no_grad():
         outputs = model(**inputs)
         
-        
+
     # Get prediction logits
     logits = torch.max(outputs['logits'][0], dim=-1)
     scores = torch.sigmoid(logits.values).cpu().detach().numpy()
     all_scores = torch.sigmoid(outputs['logits'][0]).cpu().detach().numpy()
+
+    all_scores_ensemble = []
+    prompts_groups = build_all_prompts(vocabulary)
+    for prompts in prompts_groups:
+        inputs_prompts = processor(text=prompts, images=im, return_tensors="pt", padding="max_length", max_length=16).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+
+        scores = torch.sigmoid(outputs['logits'][0])  # [num_queries, num_prompts]
+
+        final_score = ensemble_scores(scores)         # [num_queries]
+
+        all_scores_ensemble.append(final_score.unsqueeze(-1))
+    
+    all_scores_ensemble = torch.cat(all_scores_ensemble, dim=1)
+    logits = torch.max(all_scores_ensemble, dim=-1)
+    scores = logits.values.cpu().detach().numpy()
+    labels = logits.indices.cpu().detach().numpy()
     
     # Get prediction labels and boundary boxes
     labels = logits.indices.cpu().detach().numpy()
@@ -236,7 +345,7 @@ def main():
         print("Large model loaded")
     else:
         processor = Owlv2Processor.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
-        model = Owlv2ForObjectDetection.from_pretrained("epoch3_baseline/")
+        model = Owlv2ForObjectDetection.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
         print("Base model loaded")
     model = model.to(device)
     model.eval()
