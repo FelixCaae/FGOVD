@@ -1,535 +1,478 @@
+import argparse
 import torch
-import torch.nn.functional as F
+
+from tqdm import tqdm
+
+# Use GPU if available
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+from torchvision.ops import batched_nms
+from PIL import Image
+# import some common libraries
+import sys
 import numpy as np
-from typing import List, Dict, Tuple
-import re
-# import nltk
-# from nltk.corpus import stopwords
-# from nltk.tokenize import word_tokenize
+import os, cv2, random
+from skimage import io as skimage_io
+
+from transformers import OwlViTProcessor, OwlViTForObjectDetection, OwlViTTextConfig
 from transformers import Owlv2Processor, Owlv2ForObjectDetection
-# import spacy  # 用于更好的属性提取
 
-# 下载必要的NLTK数据
-# try:
-#     nltk.data.find('tokenizers/punkt')
-# except LookupError:
-#     nltk.download('punkt')
-#     nltk.download('stopwords')
+import numpy as np
 
-class AttributeAwareOwlViT:
-    """属性感知的OwlViT推理，支持细粒度增强"""
-    
-    def __init__(self, 
-                 model_path: str, 
-                 processor_path: str,
-                 attribute_vocab: List[str] = None,
-                 device: str = "cuda"):
-        """
-        初始化属性感知的OwlViT
-        
-        Args:
-            model_path: OwlViT模型路径
-            processor_path: 处理器路径
-            attribute_vocab: 属性词汇列表，如['red', 'large', 'wooden', ...]
-            device: 计算设备
-        """
-        self.device = device if torch.cuda.is_available() and device == "cuda" else "cpu"
-        
-        # 加载模型和处理器
-        self.processor = Owlv2Processor.from_pretrained(processor_path)
-        self.model = Owlv2ForObjectDetection.from_pretrained(model_path).to(self.device)
-        self.model.eval()
-        
-        # 属性词汇表
-        if attribute_vocab is None:
-            # 默认属性词汇表（可扩展）
-            self.attribute_vocab = [
-                'red', 'blue', 'green', 'yellow', 'black', 'white', 'brown', 'gray',
-                'large', 'small', 'big', 'little', 'tall', 'short', 'wide', 'narrow',
-                'wooden', 'metal', 'plastic', 'glass', 'fabric', 'leather', 'stone',
-                'circular', 'square', 'rectangular', 'triangular', 'round', 'oval',
-                'shiny', 'matte', 'transparent', 'opaque', 'reflective',
-                'striped', 'spotted', 'patterned', 'plain', 'textured',
-                'old', 'new', 'modern', 'antique', 'vintage',
-                'soft', 'hard', 'smooth', 'rough', 'sharp', 'blunt'
-            ]
-        else:
-            self.attribute_vocab = attribute_vocab
-        
-        # 加载spacy用于更好的属性提取
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except:
-            print("未找到spacy模型，使用简单规则提取属性")
-            self.nlp = None
-        
-        # 停用词
-        # self.stop_words = set(stopwords.words('english'))
-    
-    def extract_attributes(self, text: str) -> List[str]:
-        """
-        从文本中提取属性词
-        
-        Args:
-            text: 输入文本，如"a large red wooden table"
-            
-        Returns:
-            List[str]: 提取的属性词列表，如['large', 'red', 'wooden']
-        """
-        # if self.nlp is not None:
-        #     # 使用spacy提取
-        #     doc = self.nlp(text)
-        #     attributes = []
-            
-        #     for token in doc:
-        #         # 提取形容词和名词
-        #         if token.pos_ in ['ADJ', 'NOUN'] and token.text.lower() in self.attribute_vocab:
-        #             if token.text.lower() not in self.stop_words:
-        #                 attributes.append(token.text.lower())
-            
-        #     return attributes
-        
-        # else:
-        # 使用简单规则提取
-        words = word_tokenize(text.lower())
-        attributes = []
-        
-        for word in words:
-            if word in self.attribute_vocab and word not in self.stop_words:
-                attributes.append(word)
-        
-        return attributes
-    
-    def encode_attribute_texts(self, attributes: List[str]) -> torch.Tensor:
-        """
-        编码属性文本为特征
-        
-        Args:
-            attributes: 属性词列表
-            
-        Returns:
-            torch.Tensor: 属性特征 [num_attributes, feature_dim]
-        """
-        if not attributes:
-            return None
-        
-        # 使用模型编码属性文本
-        with torch.no_grad():
-            attribute_inputs = self.processor(
-                text=attributes,
-                return_tensors="pt",
-                padding=True,
-                truncation=True
-            ).to(self.device)
-            
-            # 获取文本特征
-            # 注意：需要从模型中提取文本编码器的特征
-            text_outputs = self.model.owlvit.text_model(**attribute_inputs)
-            attribute_features = text_outputs.last_hidden_state.mean(dim=1)  # [num_attrs, dim]
-            
-        return attribute_features
-    
-    def extract_visual_features(self, image: np.ndarray) -> torch.Tensor:
-        """
-        提取图像的视觉特征
-        
-        Args:
-            image: 输入图像 [H, W, 3]
-            
-        Returns:
-            torch.Tensor: 视觉特征 [num_patches, feature_dim]
-        """
-        with torch.no_grad():
-            # 预处理图像
-            inputs = self.processor(
-                images=image,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # 获取视觉特征
-            import pdb;pdb.set_trace()
-            vision_outputs = self.model.owlv2.vision_model(**inputs)
-            # 通常取最后一层的[CLS] token或平均池化
-            visual_features = vision_outputs.last_hidden_state[:, 1:, :]  # 去除[CLS] token
-            visual_features = visual_features.mean(dim=1)  # 全局平均池化
-            
-        return visual_features
-    
-    def attribute_aware_similarity(self, 
-                                  visual_features: torch.Tensor,
-                                  attribute_features: torch.Tensor,
-                                  main_text_feature: torch.Tensor,
-                                  method: str = "weighted") -> torch.Tensor:
-        """
-        计算属性感知的相似度
-        
-        Args:
-            visual_features: 视觉特征 [batch_size, feature_dim]
-            attribute_features: 属性特征 [num_attributes, feature_dim]
-            main_text_feature: 主文本特征 [1, feature_dim]
-            method: 融合方法，可选"weighted", "max", "mean"
-            
-        Returns:
-            torch.Tensor: 增强后的相似度分数
-        """
-        batch_size = visual_features.shape[0]
-        
-        if attribute_features is None or len(attribute_features) == 0:
-            # 没有属性，使用原始相似度
-            similarity = F.cosine_similarity(
-                visual_features.unsqueeze(1),  # [batch, 1, dim]
-                main_text_feature.unsqueeze(0),  # [1, 1, dim]
-                dim=-1
-            ).squeeze(1)
-            return similarity
-        
-        num_attributes = len(attribute_features)
-        
-        # 计算与每个属性的相似度
-        # visual_features: [batch, dim]
-        # attribute_features: [num_attrs, dim]
-        attr_similarities = []
-        for i in range(num_attributes):
-            attr_sim = F.cosine_similarity(
-                visual_features,
-                attribute_features[i:i+1].expand(batch_size, -1),
-                dim=-1
-            )
-            attr_similarities.append(attr_sim)
-        
-        attr_similarities = torch.stack(attr_similarities, dim=1)  # [batch, num_attrs]
-        
-        # 计算主文本相似度
-        main_similarity = F.cosine_similarity(
-            visual_features,
-            main_text_feature.expand(batch_size, -1),
-            dim=-1
-        )  # [batch]
-        
-        # 融合策略
-        if method == "weighted":
-            # 基于属性相似度加权的融合
-            attr_weights = F.softmax(attr_similarities.mean(dim=0, keepdim=True), dim=1)  # [1, num_attrs]
-            weighted_attr_sim = (attr_similarities * attr_weights).sum(dim=1)  # [batch]
-            
-            # 主相似度和属性相似度的加权平均
-            alpha = 0.7  # 主相似度权重
-            enhanced_similarity = alpha * main_similarity + (1-alpha) * weighted_attr_sim
-            
-        elif method == "max":
-            # 取最大值
-            max_attr_sim = attr_similarities.max(dim=1)[0]  # [batch]
-            enhanced_similarity = torch.max(main_similarity, max_attr_sim)
-            
-        elif method == "mean":
-            # 平均值
-            mean_attr_sim = attr_similarities.mean(dim=1)  # [batch]
-            enhanced_similarity = 0.5 * main_similarity + 0.5 * mean_attr_sim
-            
-        elif method == "attention":
-            # 注意力机制融合
-            # 计算注意力权重
-            all_features = torch.cat([
-                main_text_feature.unsqueeze(0),  # [1, dim]
-                attribute_features  # [num_attrs, dim]
-            ], dim=0)  # [1+num_attrs, dim]
-            
-            # 计算注意力
-            attention_scores = torch.matmul(
-                visual_features.unsqueeze(1),  # [batch, 1, dim]
-                all_features.transpose(0, 1).unsqueeze(0)  # [1, dim, 1+num_attrs]
-            ).squeeze(1)  # [batch, 1+num_attrs]
-            
-            attention_weights = F.softmax(attention_scores, dim=-1)  # [batch, 1+num_attrs]
-            
-            # 加权相似度
-            all_similarities = torch.cat([
-                main_similarity.unsqueeze(1),  # [batch, 1]
-                attr_similarities  # [batch, num_attrs]
-            ], dim=1)  # [batch, 1+num_attrs]
-            
-            enhanced_similarity = (attention_weights * all_similarities).sum(dim=1)
-        
-        return enhanced_similarity
-    
-    def predict(self, 
-                image: np.ndarray, 
-                text_prompt: str,
-                extract_attributes: bool = True,
-                fusion_method: str = "weighted",
-                nms_threshold: float = 0.5,
-                max_predictions: int = 100) -> Dict:
-        """
-        属性感知的预测
-        
-        Args:
-            image: 输入图像 [H, W, 3]
-            text_prompt: 文本提示
-            extract_attributes: 是否提取属性
-            fusion_method: 融合方法
-            nms_threshold: NMS阈值
-            max_predictions: 最大预测数
-            
-        Returns:
-            Dict: 预测结果
-        """
-        with torch.no_grad():
-            # 1. 提取视觉特征
-            visual_features = self.extract_visual_features(image)  # [1, dim]
-            #这里有点要改的，应该提取密集特征，然后用正样本的框去做RoI Pooling得到Instance特征再去测分数
-            # 2. 处理文本提示
-            if extract_attributes:
-                # 提取属性
-                attributes = self.extract_attributes(text_prompt)
-                print(f"提取的属性: {attributes}")
-                
-                # 编码属性
-                attribute_features = self.encode_attribute_texts(attributes)
-                
-                # 编码主文本
-                main_inputs = self.processor(
-                    text=[text_prompt],
-                    return_tensors="pt"
-                ).to(self.device)
-                main_text_outputs = self.model.owlvit.text_model(**main_inputs)
-                main_text_feature = main_text_outputs.last_hidden_state.mean(dim=1)  # [1, dim]
-                
-                # 计算属性感知相似度
-                similarity = self.attribute_aware_similarity(
-                    visual_features,
-                    attribute_features,
-                    main_text_feature,
-                    method=fusion_method
-                )
-                
+import pickle, json
+
+# READ/WRITE UTILITIES
+
+import spacy
+
+nlp = spacy.load("en_core_web_sm")
+
+COLORS = ['black', 'light_blue', 'blue', 'dark_blue', 'light_brown', 'brown', 'dark_brown', 'light_green', 'green', 'dark_green', 'light_grey', 'grey', 'dark_grey', 'light_orange', 'orange', 'dark_orange', 'light_pink', 'pink', 'dark_pink', 'light_purple', 'purple', 'dark_purple', 'light_red', 'red', 'dark_red', 'white', 'light_yellow', 'yellow', 'dark_yellow']
+MATERIALS = ['text', 'stone', 'wood', 'rattan', 'fabric', 'crochet', 'wool', 'leather', 'velvet', 'metal', 'paper', 'plastic', 'glass', 'ceramic']
+PATTERNS = ['plain', 'striped', 'dotted', 'checkered', 'woven', 'studded', 'perforated', 'floral', 'logo']
+TRANSPARENCIES = ['opaque', 'translucent', 'transparent']
+
+ATTRIBUTE_VOCAB = {
+    "color": COLORS,
+    "material": MATERIALS,
+    "pattern": PATTERNS,
+    "transparency": TRANSPARENCIES
+}
+
+def extract_attributes(sentence):
+    doc = nlp(sentence)
+    attrs = []
+    obj = None
+
+    tokens = list(doc)
+    i = 0
+    vocab_set = set()
+    for v in ATTRIBUTE_VOCAB.values():
+        vocab_set.update(v)
+
+    while i < len(tokens):
+        token = tokens[i]
+        if token.pos_ == "ADJ":
+            if token.text.lower() in ["light", "dark"]:
+                combined_attrs = token.text.lower() + " " + tokens[i+1].text.lower()
+                attrs.append(combined_attrs)
+                i+=2
+                continue
             else:
-                # 标准推理
-                inputs = self.processor(
-                    text=[text_prompt],
-                    images=image,
-                    return_tensors="pt"
-                ).to(self.device)
-                
-                outputs = self.model(**inputs)
-                similarity = torch.sigmoid(outputs.logits[0]).max(dim=-1)[0]
-            
-            # 3. 获取检测结果
-            inputs = self.processor(
-                text=[text_prompt],
-                images=image,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            outputs = self.model(**inputs)
-            
-            # 处理输出
-            logits = torch.max(outputs['logits'][0], dim=-1)
-            scores = torch.sigmoid(logits.values).cpu().numpy()
-            
-            if extract_attributes:
-                # 用属性增强的相似度替换原始分数
-                scores = similarity.cpu().numpy()
-            
-            labels = logits.indices.cpu().numpy()
-            boxes = outputs['pred_boxes'][0].cpu().numpy()
-            
-            # 4. 后处理
-            height, width = image.shape[:2]
-            converted_boxes = []
-            for box in boxes:
-                cx, cy, w, h = box
-                x1 = (cx - w/2) * width
-                y1 = (cy - h/2) * height
-                x2 = (cx + w/2) * width
-                y2 = (cy + h/2) * height
-                converted_boxes.append([x1, y1, x2, y2])
-            
-            # 5. 过滤和排序
-            data = list(zip(scores, converted_boxes, labels))
-            sorted_data = sorted(data, key=lambda x: x[0], reverse=True)
-            
-            # 6. NMS
-            if nms_threshold > 0 and len(sorted_data) > 0:
-                scores_nms = [x[0] for x in sorted_data]
-                boxes_nms = [x[1] for x in sorted_data]
-                labels_nms = [x[2] for x in sorted_data]
-                
-                from torchvision.ops import batched_nms
-                
-                boxes_tensor = torch.tensor(boxes_nms)
-                scores_tensor = torch.tensor(scores_nms)
-                labels_tensor = torch.tensor(labels_nms)
-                
-                keep_indices = batched_nms(boxes_tensor, scores_tensor, labels_tensor, nms_threshold)
-                
-                filtered_data = [sorted_data[i] for i in keep_indices]
-                filtered_data = filtered_data[:max_predictions]
+                attrs.append(token.text.lower())
+        if token.pos_ == "NOUN":
+            if token.text.lower() in vocab_set:
+                attrs.append(token.text.lower())
+                i += 1
+                continue
             else:
-                filtered_data = sorted_data[:max_predictions]
-            
-            # 7. 格式化输出
-            result = {
-                'scores': [x[0] for x in filtered_data],
-                'boxes': [x[1] for x in filtered_data],
-                'labels': [x[2] for x in filtered_data],
-                'text_prompt': text_prompt,
-                'attributes_extracted': attributes if extract_attributes else []
-            }
-            
-            return result
+                obj = token.text.lower()
+        i+=1
+    return attrs, obj
 
-# 使用示例
-def test_attribute_aware_owlvit():
-    """测试属性感知的OwlViT"""
-    import cv2
-    
-    # 初始化
-    model_path ="epoch3_baseline/" # "google/owlv2-base-patch16-ensemble"
-    processor_path = "/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16" #google/owlv2-base-patch16-ensemble"
-    # processor = Owlv2Processor.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
-    # model = Owlv2ForObjectDetection.from_pretrained("epoch3_baseline/")
-    
-    detector = AttributeAwareOwlViT(
-        model_path=model_path,
-        processor_path=processor_path,
-        device="cuda"
-    )
-    
-    # 加载测试图像
-    image = cv2.imread("test_image.jpg")
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-    # 测试提示
-    test_prompts = [
-        "a large red wooden table",  # 包含多个属性
-        "a small black cat",         # 包含属性
-        "a black tv",
-        "a red tv",
-        "a blue tv",
-        "a person",                  # 不包含明显属性
-    ]
-    
-    for prompt in test_prompts:
-        print(f"\n{'='*50}")
-        print(f"测试提示: {prompt}")
-        print('='*50)
-        
-        # 标准推理
-        print("\n1. 标准推理:")
-        result_standard = detector.predict(
-            image, prompt, extract_attributes=False
-        )
-        print(f"   检测到 {len(result_standard['boxes'])} 个物体")
-        if len(result_standard['scores']) > 0:
-            print(f"   最高分数: {max(result_standard['scores']):.4f}")
-        
-        # 属性感知推理
-        print("\n2. 属性感知推理:")
-        result_enhanced = detector.predict(
-            image, prompt, extract_attributes=True, fusion_method="weighted"
-        )
-        print(f"   检测到 {len(result_enhanced['boxes'])} 个物体")
-        if len(result_enhanced['scores']) > 0:
-            print(f"   最高分数: {max(result_enhanced['scores']):.4f}")
-        
-        # 比较
-        if len(result_standard['scores']) > 0 and len(result_enhanced['scores']) > 0:
-            standard_max = max(result_standard['scores'])
-            enhanced_max = max(result_enhanced['scores'])
-            improvement = (enhanced_max - standard_max) / standard_max * 100
-            print(f"\n   分数提升: {improvement:.1f}%")
+def build_attribute_prompts(attrs, obj):
+    prompts = []
+    for a in attrs:
+        prompts.append(f"a {a} {obj}")
+    return prompts
 
-# 批量测试函数
-def evaluate_attribute_awareness(dataset_path: str, 
-                                detector: AttributeAwareOwlViT,
-                                num_samples: int = 100):
+def build_all_prompts(vocabulary):
+
+    all_prompt_groups = []
+
+    for sent in vocabulary:
+
+        attrs, obj = extract_attributes(sent)
+
+        attr_prompts = build_attribute_prompts(attrs, obj)
+        obj_prompt = f"a {obj}"
+
+        # 最终 prompt 组
+        prompts = [sent] + attr_prompts + [obj_prompt]
+
+        all_prompt_groups.append(prompts)
+
+    return all_prompt_groups
+
+def ensemble_scores(scores, w0=1.0, w1=0.2, w2=0.):
+
+    # scores: [num_queries, num_prompts]
+
+    s_full = scores[:, 0]              # 原始句子
+    s_attrs = scores[:, 1:-1]          # 属性
+    s_obj = scores[:, -1]              # object
+
+    if s_attrs.shape[1] > 0:
+        s_attr_mean = s_attrs.mean(dim=1)
+    else:
+        s_attr_mean = 0
+
+    # ⭐ 推荐权重（你可以做 ablation）
+    final_score = w0 * s_full + w1 * s_attr_mean + w2 * s_obj
+
+    return final_score
+
+def save_object(obj, path):
     """
-    在数据集上评估属性感知策略的效果
+    Save an object using the pickle library to a file.
+    Automatically creates the directory if it doesn't exist.
     
+    :param obj: any python object. Object to save
+    :param path: str or Path. File path to save the object
+    """
+    from pathlib import Path
+    # 将路径转换为Path对象以便统一处理
+    save_path = Path(path)
+    
+    # 获取父目录
+    save_dir = save_path.parent
+    
+    # 如果父目录不存在，则创建（包括所有中间目录）
+    if not save_dir.exists():
+        print(f"Creating directory: {save_dir}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 保存对象
+    print(f"Saving to: {save_path}")
+    with open(save_path, 'wb') as fid:
+        pickle.dump(obj, fid)
+    print(f"Save completed.")
+
+def load_object(path):
+    """"Load an object from a file
+    
+    :param fileName: str. Name of the file of the object to load
+    :return: obj: undefined. Object loaded
+    """
+    try:
+        with open(path, 'rb') as fid:
+            obj = pickle.load(fid)
+            return obj
+    except IOError:
+        return None   
+
+def read_json(file_name):
+    #Read JSON file
+    with open(file_name) as infile:
+        data = json.load(infile)
+    return data
+
+def write_json(data, file_name):
+    # Write JSON file
+    with open(file_name, "w") as outfile:
+        json.dump(data, outfile)
+
+def convert_to_x1y1x2y2(bbox, img_width, img_height):
+    """
+    Convert bounding boxes from [cx, cy, w, h] to [x1, y1, x2, y2] format.
+
     Args:
-        dataset_path: 数据集路径
-        detector: 属性感知检测器
-        num_samples: 测试样本数
-    """
-    import json
-    from tqdm import tqdm
-    
-    # 加载数据集
-    with open(dataset_path, 'r') as f:
-        data = json.load(f)
-    
-    improvements = []
-    attribute_counts = []
-    
-    # 随机采样
-    import random
-    samples = random.sample(data['annotations'], min(num_samples, len(data['annotations'])))
-    
-    for ann in tqdm(samples, desc="评估属性感知"):
-        # 获取图像
-        image_id = ann['image_id']
-        image_info = next(img for img in data['images'] if img['id'] == image_id)
-        image_path = image_info['file_name']
-        
-        # 加载图像
-        image = cv2.imread(image_path)
-        if image is None:
-            continue
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # 构建提示
-        category_id = ann['category_id']
-        category = next(cat for cat in data['categories'] if cat['id'] == category_id)
-        prompt = f"a {category['name']}"
-        
-        # 添加属性（如果有）
-        if 'attributes' in ann:
-            for attr in ann['attributes']:
-                prompt += f" {attr}"
-        
-        # 标准推理
-        result_std = detector.predict(image, prompt, extract_attributes=False)
-        
-        # 属性感知推理
-        result_enh = detector.predict(image, prompt, extract_attributes=True)
-        
-        # 记录属性数量
-        attributes = detector.extract_attributes(prompt)
-        attribute_counts.append(len(attributes))
-        
-        # 比较分数
-        if result_std['scores'] and result_enh['scores']:
-            std_score = max(result_std['scores'])
-            enh_score = max(result_enh['scores'])
-            
-            if std_score > 0:
-                improvement = (enh_score - std_score) / std_score * 100
-                improvements.append(improvement)
-    
-    # 分析结果
-    if improvements:
-        avg_improvement = np.mean(improvements)
-        std_improvement = np.std(improvements)
-        
-        print(f"\n评估结果:")
-        print(f"  平均提升: {avg_improvement:.2f}%")
-        print(f"  标准差: {std_improvement:.2f}%")
-        print(f"  最大提升: {max(improvements):.2f}%")
-        print(f"  最小提升: {min(improvements):.2f}%")
-        
-        # 按属性数量分组
-        import pandas as pd
-        df = pd.DataFrame({
-            'improvement': improvements[:len(attribute_counts)],
-            'num_attributes': attribute_counts
-        })
-        
-        group_stats = df.groupby('num_attributes')['improvement'].agg(['mean', 'count'])
-        print(f"\n按属性数量的提升:")
-        print(group_stats)
-    
-    return improvements, attribute_counts
+        bbox (np.array): NumPy array of bounding boxes in the format [cx, cy, w, h].
+        img_width (int): Width of the image.
+        img_height (int): Height of the image.
 
-if __name__ == "__main__":
-    # 运行测试
-    test_attribute_aware_owlvit()
+    Returns:
+        np.array: NumPy array of bounding boxes in the format [x1, y1, x2, y2].
+    """
+    cx, cy, w, h = bbox
+    x1 = (cx - w / 2) * img_width
+    y1 = (cy - h / 2) * img_height
+    x2 = (cx + w / 2) * img_width
+    y2 = (cy + h / 2) * img_height
+    return np.array([x1, y1, x2, y2])
+
+def apply_NMS(boxes, scores, labels, total_scores, iou=0.5):
+    indexes_to_keep = batched_nms(torch.stack([torch.FloatTensor(box) for box in boxes], dim=0),
+                       torch.FloatTensor(scores),
+                       torch.IntTensor(labels),
+                       iou)
+    
+    filtered_boxes = []
+    filtered_scores = []
+    filtered_labels = []
+    filtered_total_scores = []
+    deleted_boxes = []
+    deleted_scores = []
+    deleted_labels = []
+    deleted_total_scores = []
+    
+    for x in range(len(boxes)):
+        if x in indexes_to_keep:
+            filtered_boxes.append(boxes[x])
+            filtered_scores.append(scores[x])
+            filtered_labels.append(labels[x])
+            filtered_total_scores.append(total_scores[x])
+        else:
+            deleted_boxes.append(boxes[x])
+            deleted_scores.append(scores[x])
+            deleted_labels.append(labels[x])
+            deleted_total_scores.append(total_scores[x])
+    
+    return filtered_boxes, filtered_scores, filtered_labels, filtered_total_scores
+
+skipped_categories = 0
+def evaluate_image(model, processor, im, vocabulary, MAX_PREDICTIONS=100, nms=False):
+    global skipped_categories
+    # preparing the inputs
+    inputs = processor(text=vocabulary, images=im, return_tensors="pt", padding=True).to(device)
+    
+    # if the tokens length is above 16, the model can't handle them
+    if  inputs['input_ids'].shape[1] > 16:
+        skipped_categories += 1
+        return None
+    
+    # Get predictions
+    with torch.no_grad():
+        outputs = model(**inputs)
+        
+        
+    # Get prediction logits
+    logits = torch.max(outputs['logits'][0], dim=-1)
+    scores = torch.sigmoid(logits.values).cpu().detach().numpy()
+    all_scores = torch.sigmoid(outputs['logits'][0]).cpu().detach().numpy()
+    
+    # Get prediction labels and boundary boxes
+    labels = logits.indices.cpu().detach().numpy()
+    boxes = outputs['pred_boxes'][0].cpu().detach().numpy()    
+        
+    scores_filtered = []
+    labels_filtered = []
+    boxes_filtered = []
+    total_scores_filtered = []
+    height = max(im.shape)
+    width = max(im.shape)
+    
+    boxes = [convert_to_x1y1x2y2(box, width, height) for box in boxes]
+    # Combine the lists into tuples using zip
+    if nms:
+        # apply NMS
+        boxes, scores, labels, all_scores = apply_NMS(boxes, scores, labels, all_scores)
+    data = list(zip(scores, boxes, labels, all_scores))
+
+    # Sort the combined data based on the first element of each tuple (score) in decreasing order
+    sorted_data = sorted(data, key=lambda x: x[0], reverse=True)
+    
+    
+    # filtering the predictions with low confidence
+    for score, box, label, total_scores in sorted_data[:MAX_PREDICTIONS]:
+        scores_filtered.append(score)
+        labels_filtered.append(label)
+        # boxes_filtered.append(convert_to_x1y1x2y2(box, width, height))
+        boxes_filtered.append(box)
+        total_scores_filtered.append(total_scores)
+    
+    return {
+        'scores': scores_filtered,
+        'labels': labels_filtered,
+        'boxes': boxes_filtered,
+        'total_scores': total_scores_filtered
+    }
+        
+skipped_categories = 0
+def evaluate_image_attr(model, processor, im, vocabulary, MAX_PREDICTIONS=100, nms=False):
+    global skipped_categories
+    
+    # 1. 构建增强的prompt组
+    prompts_groups = build_all_prompts(vocabulary)  # 二维列表：[num_groups, prompts_per_group]
+    # 2. 合并所有prompt并记录索引
+    all_prompts = []
+    group_indices = []
+    group_start_idx = 0
+    
+    for prompts in prompts_groups:
+        all_prompts.extend(prompts)
+        group_end_idx = group_start_idx + len(prompts)
+        group_indices.append((group_start_idx, group_end_idx))
+        group_start_idx = group_end_idx
+    
+    # 3. 一次性处理所有prompt
+    inputs = processor(
+        text=all_prompts, 
+        images=im, 
+        return_tensors="pt", 
+        padding=True, 
+        # max_length=16
+    ).to(device)
+    
+    # 4. 检查token长度
+    if inputs['input_ids'].shape[1] > 16:
+        skipped_categories += 1
+        return None
+    
+    # 5. 模型推理
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    # 6. 获取所有得分
+    all_raw_scores = torch.sigmoid(outputs['logits'][0])  # [num_queries, total_prompts]
+    boxes = outputs['pred_boxes'][0].cpu().detach().numpy()  # [num_queries, 4]
+    # 7. 按组提取并计算集成得分
+    all_scores = []
+    for start_idx, end_idx in group_indices:
+        group_scores = all_raw_scores[:, start_idx:end_idx]  # [num_queries, group_size]
+        final_score = ensemble_scores(group_scores)           # [num_queries]
+        all_scores.append(final_score.unsqueeze(-1))
+    
+    all_scores = torch.cat(all_scores, dim=1)  # [num_queries, num_groups]
+    
+    # 8. 获取最佳得分和标签
+    logits = torch.max(all_scores, dim=-1)
+    scores = logits.values.cpu().detach().numpy()
+    labels = logits.indices.cpu().detach().numpy()
+    
+    # 9. 后处理
+    scores_filtered = []
+    labels_filtered = []
+    boxes_filtered = []
+    total_scores_filtered = []
+    
+    # 确保使用正确的高度和宽度
+    height = max(im.shape)
+    width = max(im.shape)
+    
+    # 转换边界框格式
+    boxes_converted = [convert_to_x1y1x2y2(box, width, height) for box in boxes]
+    
+    # 应用NMS
+    if nms:
+        # 注意：这里需要传入正确的total_scores
+        # 如果NMS需要使用原始所有得分，可以传入all_scores对应的行
+        boxes_converted, scores, labels, all_scores = apply_NMS(
+            boxes_converted, 
+            scores, 
+            labels, 
+            all_scores.cpu().numpy()  # 传入集成的总得分
+        )
+    
+    # 排序和过滤
+    data = list(zip(scores, boxes_converted, labels, all_scores.cpu().numpy()))
+    sorted_data = sorted(data, key=lambda x: x[0], reverse=True)
+    
+    for score, box, label, total_score_vector in sorted_data[:MAX_PREDICTIONS]:
+        scores_filtered.append(score)
+        labels_filtered.append(label)
+        boxes_filtered.append(box)
+        total_scores_filtered.append(total_score_vector)  # 保存整个向量
+    
+    return {
+        'scores': scores_filtered,
+        'labels': labels_filtered,
+        'boxes': boxes_filtered,
+        'total_scores': total_scores_filtered
+    }
+        
+    
+
+def get_category_name(id, categories):
+    for category in categories:
+        if id == category['id']:
+            return category['name']
+        
+def get_image_filepath(id, images):
+    for image in images:
+        if id == image['id']:
+            return image['file_name']
+
+def create_vocabulary(ann, categories):
+    vocabulary_id = [ann['category_id']] + ann['neg_category_ids']
+    vocabulary = [get_category_name(id, categories) for id in vocabulary_id]
+    
+    return vocabulary, vocabulary_id
+
+def adjust_out_id(output, vocabulary_id):
+    for i in range(len(output['labels'])):
+        output['labels'][i] = vocabulary_id[output['labels'][i]]
+    return output
+
+# def convert_to_standard_format(output):
+#     return {
+#             'labels': output['instances'].pred_classes.cpu().numpy().tolist(),
+#             'boxes': output['instances'].pred_boxes.tensor.cpu().numpy().tolist(),
+#             'scores': output['instances'].scores.cpu().numpy().tolist(),
+#             'annotation_id': output['annotation_id'],
+#             'image_filepath': output['image_filepath']
+#     }
+
+
+# def convert_to_standard_format_complete(outputs):
+#     std_out = []
+    
+#     #print("Converting predictions in standard format")
+#     for output in outputs:
+#         std_out.append({
+#             'labels': output['labels'].cpu().numpy().tolist(),
+#             'boxes': output['boxes'].tensor.cpu().numpy().tolist(),
+#             'scores': output['scores'].cpu().numpy().tolist(),
+#             'category_id': output['category_id'],
+#             'image_filepath': output['image_filepath']
+#         })
+
+#     return std_out
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, required=True, help='Dataset to process')
+    parser.add_argument('--out', type=str, required=True, help='Out path')
+    parser.add_argument('--nms', default=False, action='store_true', help='If set it will be applied NMS with iou=0.5')
+    parser.add_argument('--large', default=False, action='store_true', help='If set, it will be loaded the large model')
+    parser.add_argument('--n_hardnegatives', type=int, default=10, help="Number of hardnegatives in each vocabulary")
+    parser.add_argument('--attr', action='store_true')
+    args = parser.parse_args()
+    global skipped_categories
+    
+    coco_path = '/gpfsdata/home/yangshuai/data/coco/'
+    if args.n_hardnegatives == 0 and '1_attributes' not in args.dataset:
+        return
+    # data = read_json('/home/lorenzobianchi/PacoDatasetHandling/jsons/captioned_%s.json' % dataset_name)
+    data = read_json(args.dataset)
+    if args.large:
+        processor = Owlv2Processor.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-large-patch14")
+        model = Owlv2ForObjectDetection.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-large-patch14")
+        print("Large model loaded")
+    else:
+        processor = Owlv2Processor.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
+        model = Owlv2ForObjectDetection.from_pretrained("/gpfsdata/home/yangshuai/open_vocabulary/FG-OVD/weights/owlv2-base-patch16")
+        print("Base model loaded")
+    model = model.to(device)
+    model.eval()
+    
+    complete_outputs = []
+    categories_done = []
+    for i, ann in enumerate(tqdm(data['annotations'])):
+        # if the category is not done, we add it to the list
+        if ann['category_id'] not in categories_done:
+            categories_done.append(ann['category_id'])
+        else:
+            continue
+        vocabulary, vocabulary_id = create_vocabulary(ann, data['categories'])
+        # check if a number of hardnegatives is setted to non-default values
+        # if it is, the vocabulary is clipped and if it is too short, we skip that image
+        len_vocabulary = args.n_hardnegatives + 1
+        if len(vocabulary) < len_vocabulary:
+            continue
+        vocabulary = vocabulary[:len_vocabulary]
+        vocabulary_id = vocabulary_id[:len_vocabulary]
+        image_filepath = coco_path + get_image_filepath(ann['image_id'], data['images'])
+        imm = cv2.cvtColor(cv2.imread(image_filepath), cv2.COLOR_BGR2RGB)
+        # imm = Image.open(image_filepath)
+        if args.attr:
+            output = evaluate_image_attr(model, processor, imm, vocabulary, nms=args.nms)
+        else:
+            output = evaluate_image(model, processor, imm, vocabulary, nms=args.nms)
+        if output == None:
+            continue
+        output['category_id'] = ann['category_id']
+        output['vocabulary'] = vocabulary_id
+        output['image_filepath'] = get_image_filepath(ann['image_id'], data['images'])
+        output = adjust_out_id(output, vocabulary_id)
+        complete_outputs.append(output)
+        
+    save_object(complete_outputs, args.out)
+    print("Skipped categories: %d/%d" % (skipped_categories, len(categories_done)))
+
+
+if __name__ == '__main__':
+    main()

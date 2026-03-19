@@ -5,10 +5,115 @@ import torch
 import numpy as np
 from PIL import Image
 from transformers import Owlv2Processor, Owlv2ForObjectDetection
+import spacy
 
+nlp = spacy.load("en_core_web_sm")
+
+COLORS = ['black', 'light_blue', 'blue', 'dark_blue', 'light_brown', 'brown', 'dark_brown', 'light_green', 'green', 'dark_green', 'light_grey', 'grey', 'dark_grey', 'light_orange', 'orange', 'dark_orange', 'light_pink', 'pink', 'dark_pink', 'light_purple', 'purple', 'dark_purple', 'light_red', 'red', 'dark_red', 'white', 'light_yellow', 'yellow', 'dark_yellow']
+MATERIALS = ['text', 'stone', 'wood', 'rattan', 'fabric', 'crochet', 'wool', 'leather', 'velvet', 'metal', 'paper', 'plastic', 'glass', 'ceramic']
+PATTERNS = ['plain', 'striped', 'dotted', 'checkered', 'woven', 'studded', 'perforated', 'floral', 'logo']
+TRANSPARENCIES = ['opaque', 'translucent', 'transparent']
+
+ATTRIBUTE_VOCAB = {
+    "color": COLORS,
+    "material": MATERIALS,
+    "pattern": PATTERNS,
+    "transparency": TRANSPARENCIES
+}
+def convert_to_x1y1x2y2(bbox, img_width, img_height):
+    """
+    Convert bounding boxes from [cx, cy, w, h] to [x1, y1, x2, y2] format.
+
+    Args:
+        bbox (np.array): NumPy array of bounding boxes in the format [cx, cy, w, h].
+        img_width (int): Width of the image.
+        img_height (int): Height of the image.
+
+    Returns:
+        np.array: NumPy array of bounding boxes in the format [x1, y1, x2, y2].
+    """
+    cx, cy, w, h = bbox
+    x1 = (cx - w / 2) * img_width
+    y1 = (cy - h / 2) * img_height
+    x2 = (cx + w / 2) * img_width
+    y2 = (cy + h / 2) * img_height
+    return np.array([x1, y1, x2, y2])
+def extract_attributes(sentence):
+    doc = nlp(sentence)
+    attrs = []
+    obj = None
+
+    tokens = list(doc)
+    i = 0
+
+    vocab_set = set()
+    for v in ATTRIBUTE_VOCAB.values():
+        vocab_set.update(v)
+
+    while i < len(tokens):
+        token = tokens[i]
+        if token.pos_ == "ADJ":
+            if token.text.lower() in ["light", "dark"]:
+                combined_attrs = token.text.lower() + " " + tokens[i+1].text.lower()
+                attrs.append(combined_attrs)
+                i+=2
+                continue
+            else:
+                attrs.append(token.text.lower())
+        if token.pos_ == "NOUN":
+            if token.text.lower() in vocab_set:
+                attrs.append(token.text.lower())
+                i += 1
+                continue
+            else:
+                obj = token.text.lower()
+        i+=1
+    return attrs, obj
+
+def build_attribute_prompts(attrs, obj):
+    prompts = []
+    for a in attrs:
+        prompts.append(f"a {a} {obj}")
+    return prompts
+
+def build_all_prompts(vocabulary):
+
+    all_prompt_groups = []
+
+    for sent in vocabulary:
+
+        attrs, obj = extract_attributes(sent)
+
+        attr_prompts = build_attribute_prompts(attrs, obj)
+        obj_prompt = f"a {obj}"
+
+        # 最终 prompt 组
+        prompts = [sent] + attr_prompts + [obj_prompt]
+
+        all_prompt_groups.append(prompts)
+
+    return all_prompt_groups
+
+def ensemble_scores(scores):
+
+    # scores: [num_queries, num_prompts]
+
+    s_full = scores[:, 0]              # 原始句子
+    s_attrs = scores[:, 1:-1]          # 属性
+    s_obj = scores[:, -1]              # object
+
+    if s_attrs.shape[1] > 0:
+        s_attr_mean = s_attrs.mean(dim=1)
+    else:
+        s_attr_mean = 0
+
+    # ⭐ 推荐权重（你可以做 ablation）
+    final_score = 0.6 * s_full + 0.3 * s_attr_mean + 0.1 * s_obj
+
+    return final_score
 def parse_args():
     parser = argparse.ArgumentParser(description="OWLv2目标检测可视化调试")
-    parser.add_argument("--image_path", type=str, required=True,
+    parser.add_argument("--image_path", type=str, required=True, default='demo',
                        help="输入图像路径（单张图片、文件夹或包含路径的txt文件）")
     parser.add_argument("--output_dir", type=str, required=True, default='vis_output',
                        help="输出结果保存目录")
@@ -18,6 +123,7 @@ def parse_args():
                        help="检测置信度阈值")
     parser.add_argument("--display_thr", type=float, default=0.1,
                        help="可视化显示阈值")
+    parser.add_argument('--attr_enhance', action='store_true', help='使用属性增强测试')
     parser.add_argument("--use_nms", action="store_true",
                        help="是否使用NMS进行后处理")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
@@ -193,73 +299,29 @@ def visualize_detections(image_np, boxes, scores, labels, prompts, color_map, di
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     
     return image_np
-
-def main(args):
-    """主函数"""
-    # 初始化设备和模型
-    device = torch.device(args.device)
-    print(f"使用设备: {device}")
-    
-    # 加载处理器和模型
-    print("加载模型...")
-    processor = Owlv2Processor.from_pretrained(args.model_name)
-    model = Owlv2ForObjectDetection.from_pretrained(args.model_name).to(device)
-    model.eval()
-    
-    # 定义检测提示词
-    prompts = [
-        "carrot", 
-        "ox",
-        "person",
-        "red apple",
-        "green apple",
-        "yellow apple",
-        "green leaves",
-        "yellow leaves",
-        "orange leaves",
-        "a person with blue clothes",
-        "a person with black clothes",
-        "a person with red clothes",
-        "a person with long hair and dressed black clothes",
-        "a person without long hair and dressed black clothes",
-        "round rock",
-        "square rock",
-        "wooden toy",
-        "metal toy"
-    ]
-    
+def process_image(image_paths, prompts, args, processor, model):
+        
     # 创建颜色映射
     color_map = create_color_map(prompts)
     
-    # 加载图像路径
-    image_paths = load_image_paths(args.image_path)
-    if not image_paths:
-        print(f"错误：未找到有效图像文件，请检查路径: {args.image_path}")
-        return
-    
-    print(f"找到 {len(image_paths)} 张图像")
-    
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # 处理每张图像
+     # 处理每张图像
     for img_idx, img_path in enumerate(image_paths, 1):
         print(f"处理图像 {img_idx}/{len(image_paths)}: {os.path.basename(img_path)}")
-        
         try:
             # 读取图像
             image_pil = Image.open(img_path).convert("RGB")
             image_np = np.array(image_pil)
             
             # 预处理
+
             inputs = processor(
-                text=prompts,
-                images=image_pil,
-                return_tensors="pt",
-                padding=True
+            text=prompts,
+            images=image_pil,
+            return_tensors="pt",
+            padding=True
             ).to(device)
-            
-            # 推理
+        
+        # 推理
             with torch.no_grad():
                 outputs = model(**inputs)
             
@@ -286,11 +348,154 @@ def main(args):
             save_path = os.path.join(args.output_dir, save_name)
             cv2.imwrite(save_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
             print(f"  结果保存至: {save_path}")
-            
+                
         except Exception as e:
             import pdb;pdb.set_trace()
             print(f"  处理失败 {img_path}: {e}")
             continue
+def process_images_attr_enhanced(image_paths, prompts, args, processor, model, device):
+        
+    # 创建颜色映射
+    color_map = create_color_map(prompts)
+    
+     # 处理每张图像
+    # 1. 构建增强的prompt组
+    prompts_groups = build_all_prompts(prompts)  # 二维列表：[num_groups, prompts_per_group]
+    # 2. 合并所有prompt并记录索引
+    all_prompts = []
+    group_indices = []
+    group_start_idx = 0
+    print(prompts_groups)
+    for group in prompts_groups:
+        all_prompts.extend(group )
+        group_end_idx = group_start_idx + len(group)
+        group_indices.append((group_start_idx, group_end_idx))
+        group_start_idx = group_end_idx
+    
+   
+    for img_idx, img_path in enumerate(image_paths, 1):
+        print(f"处理图像 {img_idx}/{len(image_paths)}: {os.path.basename(img_path)}")
+        # 读取图像
+        image_pil = Image.open(img_path).convert("RGB")
+        image_np = np.array(image_pil)
+            # 3. 一次性处理所有prompt
+        inputs = processor(
+            text=all_prompts, 
+            images=image_np, 
+            return_tensors="pt", 
+            padding="max_length", 
+            # max_length=16
+        ).to(device)
+        # 预处理
+    
+    # 推理
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        # 后处理
+        target_sizes = torch.tensor([image_pil.size[::-1]]).to(device)
+
+        all_raw_scores = torch.sigmoid(outputs['logits'][0])  # [num_queries, total_prompts]
+        boxes = outputs['pred_boxes'][0].cpu().detach().numpy()  # [num_queries, 4]
+
+        # 7. 按组提取并计算集成得分
+        all_scores_ensemble = []
+        for start_idx, end_idx in group_indices:
+            group_scores = all_raw_scores[:, start_idx:end_idx]  # [num_queries, group_size]
+            final_score = ensemble_scores(group_scores)           # [num_queries]
+            all_scores_ensemble.append(final_score.unsqueeze(-1))
+        
+        all_scores_ensemble = torch.cat(all_scores_ensemble, dim=1)  # [num_queries, num_groups]
+
+        # 8. 获取最佳得分和标签
+        logits = torch.max(all_scores_ensemble, dim=-1)
+        scores = logits.values.cpu().detach().numpy()
+        labels = logits.indices.cpu().detach().numpy()
+        filter_idx = scores > args.threshold
+
+        scores = scores[filter_idx, ]
+        labels = labels[filter_idx, ]
+        boxes = boxes[filter_idx]
+        target_sizes = target_sizes.cpu()
+        box_list = []
+        for box in boxes:
+            box_list.append(convert_to_x1y1x2y2(box,max(image_np.shape), max(image_np.shape)))
+        boxes = np.array(box_list)
+        # boxes = boxes * np.array([[target_sizes[0,1],target_sizes[0,0],target_sizes[0,1],target_sizes[0,0]]])
+        # results = processor.post_process_object_detection(
+        #     outputs=outputs,
+        #     target_sizes=target_sizes,
+        #     threshold=args.threshold
+        # )[0]
+        
+        # boxes = results["boxes"].cpu().numpy()
+        # scores = results["scores"].cpu().numpy()
+        # labels = results["labels"].cpu().numpy()
+        # 可选：应用NMS
+        if args.use_nms and len(boxes) > 0:
+            boxes, scores, labels = apply_nms(boxes, scores, labels)
+        
+        # 可视化
+        vis_image = visualize_detections(image_np.copy(), boxes, scores, labels, prompts, color_map, args.display_thr)
+        
+        # 保存结果
+        save_name = f"{os.path.splitext(os.path.basename(img_path))[0]}_result.jpg"
+        save_path = os.path.join(args.output_dir, save_name)
+        cv2.imwrite(save_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+        print(f"  结果保存至: {save_path}")
+            
+        # except Exception as e:
+        #     import pdb;pdb.set_trace()
+        #     print(f"  处理失败 {img_path}: {e}")
+        #     continue
+def main(args):
+    """主函数"""
+    # 初始化设备和模型
+    device = torch.device(args.device)
+    print(f"使用设备: {device}")
+    
+    # 加载处理器和模型
+    print("加载模型...")
+    processor = Owlv2Processor.from_pretrained(args.model_name)
+    model = Owlv2ForObjectDetection.from_pretrained(args.model_name).to(device)
+    model.eval()
+    
+    # 定义检测提示词
+    prompts = [
+        "carrot", 
+        "ox",
+        # "person",
+        "red apple",
+        "green apple",
+        "yellow apple",
+        "green leaves",
+        "yellow leaves",
+        "orange leaves",
+        "a person with blue clothes",
+        "a person with black clothes",
+        "a person with red clothes",
+        "a person with long hair and dressed black clothes",
+        "a person without long hair and dressed black clothes",
+        "round rock",
+        "square rock",
+        "wooden toy",
+        "metal toy"
+    ]
+
+    # 加载图像路径
+    image_paths = load_image_paths(args.image_path)
+    if not image_paths:
+        print(f"错误：未找到有效图像文件，请检查路径: {args.image_path}")
+        return
+    
+    print(f"找到 {len(image_paths)} 张图像")
+    
+    # 创建输出目录
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.attr_enhance:
+        process_images_attr_enhanced(image_paths, prompts, args, processor, model, device)
+    else:
+        process_images(image_paths, prompts, args, processor, model, device)
     
     print("处理完成！")
 
